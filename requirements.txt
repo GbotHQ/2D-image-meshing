@@ -1,0 +1,4 @@
+black
+opencv-python
+scipy
+scikit-image
