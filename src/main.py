@@ -18,15 +18,14 @@ def calculate_point_score(img, alpha, binary_mask):
     )
     corner_val -= np.amin(corner_val)
     corner_val /= np.amax(corner_val)
-    corner_val += 1
     corner_val = np.where(
         binary_mask, corner_val, np.random.uniform(0, 1, (corner_val.shape))
     )
 
     # calculate offset to ensure points at image boundary
-    offset = np.ones_like(corner_val)
+    offset = np.zeros_like(corner_val)
     # prioritize points on opaque areas over transparent
-    offset = np.where(binary_mask, offset, 0)
+    offset = np.where(binary_mask, 1, offset)
 
     coords = (0, -1)
     # edges
@@ -53,6 +52,7 @@ def narrow_down_points(corner_val, radius):
         np.argsort(corner_val, axis=None), corner_val.shape
     )
     argsorted_corner_val = np.stack(argsorted_corner_val, 1, dtype=np.int32)[::-1]
+
     # create a point mask with padding to account for kernel size
     point_mask = np.ones(
         (corner_val.shape[0] + diameter, corner_val.shape[1] + diameter), bool
