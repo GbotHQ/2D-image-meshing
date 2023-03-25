@@ -11,6 +11,12 @@ rng.seed(seed)
 np.random.seed(seed)
 
 
+def get_point_kernel(radius):
+    kernel = np.zeros((radius * 2 + 1,) * 2, bool)
+    kernel[radius, radius] = True
+    return kernel
+
+
 def calculate_point_score(img, alpha, binary_mask):
     # calculate corner score
     corner_val = cv.cornerMinEigenVal(
@@ -42,38 +48,105 @@ def calculate_point_score(img, alpha, binary_mask):
     return corner_val + offset * 2
 
 
-def narrow_down_points(corner_val, radius):
-    radius = radius
-    diameter = radius * 2
-    kernel_size = diameter + 1
+def iterate_kernel(argsorted_score, point_mask, kernel):
+    kernel_size = kernel.shape[0]
+    half = kernel_size // 2
+    for x, y in argsorted_score:
+        if not point_mask[x + half, y + half]:
+            continue
+        point_mask[x : x + kernel_size, y : y + kernel_size] = kernel
+
+
+def narrow_down_points(score, size):
+    kernel_size = size * 2 + 1
+    kernel = get_point_kernel(size)
+    res = np.array(score.shape, np.int32)
 
     # sort corner score in descending order
-    argsorted_corner_val = np.unravel_index(
-        np.argsort(corner_val, axis=None), corner_val.shape
-    )
-    argsorted_corner_val = np.stack(argsorted_corner_val, 1, dtype=np.int32)[::-1]
+    score_argsorted = np.unravel_index(np.argsort(score, axis=None), score.shape)
+    score_argsorted = np.stack(score_argsorted, 1).astype(np.uint32)[::-1]
 
     # create a point mask with padding to account for kernel size
-    point_mask = np.ones(
-        (corner_val.shape[0] + diameter, corner_val.shape[1] + diameter), bool
+    point_mask = np.ones(res + size * 2, bool)
+
+    iterate_kernel(score_argsorted, point_mask, kernel)
+
+    imu.imshow(point_mask.astype(np.uint8) * 255)
+
+    return np.stack(np.where(point_mask[size:, size:]), 1, dtype=np.int32)
+
+
+def crop_to_divisable(img, denominator):
+    # crop image to make it divisable by denominator
+    res = np.array(img.shape, np.int32)
+
+    cropped = np.zeros(
+        (np.ceil(res / denominator) * denominator).astype(np.int32), img.dtype
     )
-
-    for x, y in argsorted_corner_val:
-        if not point_mask[x + radius, y + radius]:
-            continue
-        point_mask[x : x + kernel_size, y : y + kernel_size] = False
-        point_mask[x + radius, y + radius] = True
-
-    return np.stack(np.where(point_mask[radius:, radius:]), 1, dtype=np.int32)
+    cropped[: res[0], : res[1]] = img
+    return cropped
 
 
-def main(img, alpha, radius):
+def fold(arr, size):
+    folded = arr.reshape(-1, size, *arr.shape[1:])
+    folded = np.moveaxis(folded, 1, 2)
+    return folded.reshape(folded.shape[0], -1, size**2, folded.shape[3])
+
+
+def narrow_down_points_cell_based(score, size, kernel_size=2):
+    kernel = get_point_kernel(kernel_size)
+
+    # crop for downsampling
+    img = crop_to_divisable(score, size)
+
+    # create an index array to map from folded array to original
+    indices = np.moveaxis(np.indices(img.shape, np.int32), 0, -1)
+
+    # divide into cells, similar to poisson disk sampling
+    indices_folded = fold(indices, size)
+    img_folded = img[indices_folded[..., 0], indices_folded[..., 1]]
+
+    # indices of max value in each cell
+    argmax = np.argmax(img_folded, -1)
+    # max value in each cell
+    amax = np.take_along_axis(img_folded, argmax[..., None], 2)[..., 0]
+    # index of max value in each cell
+    amax_indices = np.take_along_axis(indices_folded, argmax[..., None, None], 2)[
+        :, :, 0
+    ]
+
+    # sort score in descending order
+    score_argsorted = np.unravel_index(np.argsort(amax, axis=None), amax.shape)
+    score_argsorted = np.stack(score_argsorted, 1).astype(np.uint32)[::-1]
+
+    # create a point mask with padding to account for kernel size
+    point_mask = np.ones(np.array(amax.shape, np.int32) + kernel_size * 2, bool)
+
+    iterate_kernel(score_argsorted, point_mask, kernel)
+
+    amax_indices = amax_indices[
+        point_mask[kernel_size:-kernel_size, kernel_size:-kernel_size]
+    ]
+
+    empty = np.zeros_like(img, bool)
+    empty[amax_indices[..., 0], amax_indices[..., 1]] = True  # amax[point_mask]
+    empty = empty[: score.shape[0], : score.shape[1]]
+
+    # imu.imshow((img / (8 / 255)).astype(np.uint8))
+    imu.imshow(empty.astype(np.uint8) * 255)
+
+    return np.stack(np.where(empty), 1, dtype=np.int32)
+
+
+def main(img, alpha):
     binary_mask = alpha > 0
 
     corner_val = calculate_point_score(img, alpha, binary_mask)
-    points = narrow_down_points(corner_val, radius)
+    points = narrow_down_points(corner_val, 16)
+    # lower kernel size means less equal distance between points, kernel size of 2 works well, 1 works, but is noticably less equal
+    points = narrow_down_points_cell_based(corner_val, 6, 2)
 
-    # # visualize features
+    # # visualize points
     # plot_img = img.copy()
     # for point in points:
     #     cv.circle(
@@ -106,13 +179,11 @@ def main(img, alpha, radius):
 
 
 if __name__ == "__main__":
-    radius = 12
-
     img = imu.imread("test_imgs/emote_upscaled.png", alpha=True)
-    # img = cv.resize(img, (0, 0), fx=1, fy=1)
+    # img = cv.resize(img, (0, 0), fx=4, fy=4)
 
     alpha = img[..., -1]
     img = img[..., :3]
 
     for _ in range(1):
-        main(img, alpha, radius)
+        main(img, alpha)
